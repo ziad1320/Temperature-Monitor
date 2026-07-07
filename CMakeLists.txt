@@ -18,12 +18,20 @@ set(STARTUP_BASE_DIR                     ${PROJECT_PATH}/STM32-base/startup/)
 
 set(EXECUTABLE                           ${CMAKE_PROJECT_NAME})
 
-# Executable files
-add_executable(${EXECUTABLE} ${SOURCE_LIST} ${STARTUP_BASE_DIR}/${SERIES_FOLDER}/${MAPPED_DEVICE}.s
-        include/stm32f4xx_hal_conf.h
-        STM32-base-STM32Cube/HAL/STM32F4xx/inc/stm32_assert_template.h)
+# === NEW: Automatically find and include all necessary HAL source files ===
+file(GLOB HAL_SOURCES "STM32-base-STM32Cube/HAL/STM32F4xx/src/*.c")
+# Exclude template files to prevent multiple definition errors
+list(FILTER HAL_SOURCES EXCLUDE REGEX ".*_template\\.c$")
 
-# Include directories (Updated for HAL and CMSIS)
+# Executable files
+add_executable(${EXECUTABLE}
+        ${SOURCE_LIST}
+        src/onewire.c
+        ${HAL_SOURCES}
+        ${STARTUP_BASE_DIR}/${SERIES_FOLDER}/${MAPPED_DEVICE}.s
+)
+
+# Include directories
 target_include_directories(${EXECUTABLE} PUBLIC
         ${INCLUDE_LIST}
         include
@@ -49,11 +57,9 @@ target_link_options(${EXECUTABLE} PRIVATE
         ${CPU_PARAMETERS}
         -L${LINKER_SCRIPTS_BASE_DIR}
         -T${LINKER_SCRIPTS_BASE_DIR}/${SERIES_FOLDER}/${DEVICE}.ld
-        #        -nostartfiles
         -Xlinker --gc-sections
         -Wl,-Map=${CMAKE_PROJECT_NAME}.map
         --specs=nano.specs
-        #-u _printf_float                # STDIO float formatting support
 )
 
 # Execute post-build to print size
