@@ -20,13 +20,22 @@ set(EXECUTABLE                           ${CMAKE_PROJECT_NAME})
 
 # Executable files
 add_executable(${EXECUTABLE} ${SOURCE_LIST} ${STARTUP_BASE_DIR}/${SERIES_FOLDER}/${MAPPED_DEVICE}.s
-        Timer/Timer.c
-        Usart/Usart.h
-        GPIO/GPIO_private.h)
-# Include
-target_include_directories(${EXECUTABLE} PUBLIC ${INCLUDE_LIST})
+        include/stm32f4xx_hal_conf.h
+        STM32-base-STM32Cube/HAL/STM32F4xx/inc/stm32_assert_template.h)
+
+# Include directories (Updated for HAL and CMSIS)
+target_include_directories(${EXECUTABLE} PUBLIC
+        ${INCLUDE_LIST}
+        include
+        STM32-base-STM32Cube/HAL/STM32F4xx/inc
+        STM32-base-STM32Cube/HAL/STM32F4xx/inc/Legacy
+        STM32-base-STM32Cube/CMSIS/STM32F4xx/inc
+        STM32-base-STM32Cube/CMSIS/ARM/inc
+)
+
 # Project symbols
 target_compile_definitions(${EXECUTABLE} PUBLIC ${COMPILER_DEFINE})
+
 # Compiler options
 target_compile_options(${EXECUTABLE} PUBLIC
         ${CPU_PARAMETERS}
@@ -40,7 +49,7 @@ target_link_options(${EXECUTABLE} PRIVATE
         ${CPU_PARAMETERS}
         -L${LINKER_SCRIPTS_BASE_DIR}
         -T${LINKER_SCRIPTS_BASE_DIR}/${SERIES_FOLDER}/${DEVICE}.ld
-#        -nostartfiles
+        #        -nostartfiles
         -Xlinker --gc-sections
         -Wl,-Map=${CMAKE_PROJECT_NAME}.map
         --specs=nano.specs
