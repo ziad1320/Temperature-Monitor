@@ -8,6 +8,7 @@
 #define DS18B20_PIN  GPIO_PIN_1
 
 // Function Prototypes
+void Onewire_Init(TIM_HandleTypeDef *timer);
 void Delay_us(uint16_t us);
 uint8_t DS18B20_Start(void);
 void DS18B20_WriteBit(uint8_t bit);

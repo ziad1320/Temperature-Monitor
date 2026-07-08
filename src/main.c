@@ -1,110 +1,333 @@
+/**
+ * @file    main.c
+ * @brief   Non-blocking, interrupt-driven DS18B20 & ESP-01S telemetry system.
+ */
+
 #include "stm32f4xx_hal.h"
 #include "onewire.h"
 #include <stdio.h>
 #include <string.h>
-#include <sys/types.h>
+#include <stdbool.h>
 
-/* --- Peripheral Handles --- */
-TIM_HandleTypeDef htim10;
-UART_HandleTypeDef huart1;
+/* --- Network & Configuration Macros --- */
+#define WIFI_SSID             "YourSSID"
+#define WIFI_PASSWORD         "YourPassword"
+#define SERVER_IP             "192.168.1.100"
+#define SERVER_PORT           80
+
+/* --- Timing Macros (Milliseconds) --- */
+#define TEMP_READ_INTERVAL_MS 10000
+#define TEMP_CONV_DELAY_MS    800
+#define ESP_TIMEOUT_MS        5000
+
+/* --- Application State Machine --- */
+typedef enum {
+    STATE_INIT_MAC,
+    STATE_WAIT_MAC,
+    STATE_INIT_WIFI,
+    STATE_WAIT_WIFI,
+    STATE_IDLE,
+    STATE_REQUEST_TEMP,
+    STATE_WAIT_CONVERSION,
+    STATE_READ_TEMP,
+    STATE_TCP_CONNECT,
+    STATE_WAIT_TCP,
+    STATE_SEND_LEN,
+    STATE_WAIT_PROMPT,
+    STATE_SEND_PAYLOAD,
+    STATE_WAIT_SEND_OK,
+    STATE_ERROR
+} AppState_t;
+
+/* --- Local Peripheral Handles --- */
+static TIM_HandleTypeDef htim10;
+static UART_HandleTypeDef huart1;
+static IWDG_HandleTypeDef hiwdg;
+
+/* --- Interrupt-Driven UART Ring Buffer --- */
+#define RX_BUF_SIZE 256
+static volatile uint8_t rx_ring_buf[RX_BUF_SIZE];
+static volatile uint16_t rx_head = 0;
+static uint16_t rx_tail = 0;
+static uint8_t rx_byte;
+
+/* --- Static Global Buffers --- */
+static char tx_buffer[128];
+static float current_temperature = 0.0f;
 
 /* --- Function Prototypes --- */
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_TIM10_Init(void);
 static void MX_USART1_UART_Init(void);
-void ESP01_SendCommand(const char *cmd);
+static void MX_IWDG_Init(void);
+void Error_Handler(void);
+bool UART_CheckResponse(const char *expected);
 
 int main(void)
 {
     /* Initialize the HAL Library */
     HAL_Init();
 
-    /* Configure the System Clock to 84 MHz */
-    SystemClock_Config();
+    /*
+     * ====================================================================
+     * PROTEUS VS REAL HARDWARE TOGGLE
+     * ====================================================================
+     * IF IN PROTEUS: Comment out SystemClock_Config() so it runs at 16MHz.
+     * IF ON REAL HARDWARE: Leave it uncommented to run at 84MHz.
+     * ====================================================================
+     */
+    // SystemClock_Config();
 
     /* Initialize all configured peripherals */
     MX_GPIO_Init();
     MX_TIM10_Init();
     MX_USART1_UART_Init();
+    MX_IWDG_Init();
 
-    /* Start the microsecond timer */
-    HAL_TIM_Base_Start(&htim10);
+    /* Pass the timer reference to the OneWire driver */
+    Onewire_Init(&htim10);
 
-    uint8_t temp_byte1, temp_byte2;
-    uint16_t raw_temp;
-    float temperature;
-    char uart_buffer[100];
+    /* Start the microsecond timer for 1-Wire */
+    if (HAL_TIM_Base_Start(&htim10) != HAL_OK) {
+        Error_Handler();
+    }
 
-    /* Allow ESP-01S time to boot */
-    HAL_Delay(2000);
+    /* Start UART Interrupt Reception */
+    HAL_UART_Receive_IT(&huart1, (uint8_t*)&rx_byte, 1);
 
-    /* Basic ESP-01S Network Setup */
-    // Put ESP in Station Mode
-    ESP01_SendCommand("AT+CWMODE=1\r\n");
-    HAL_Delay(500);
-    // Connect to WiFi (Replace with actual SSID and Password)
-    ESP01_SendCommand("AT+CWJAP=\"YourSSID\",\"YourPassword\"\r\n");
-    HAL_Delay(5000);
+    /* State Machine Variables */
+    AppState_t current_state = STATE_INIT_MAC;
+    uint32_t state_timer = HAL_GetTick();
+
+    /* Give the UART interrupt a moment to settle */
+    HAL_Delay(100);
 
     while (1)
     {
-        /* 1. Request Temperature Conversion */
-        if (DS18B20_Start())
+        /* Pet the Watchdog */
+        HAL_IWDG_Refresh(&hiwdg);
+
+        uint32_t current_time = HAL_GetTick();
+
+        switch (current_state)
         {
-            DS18B20_WriteByte(0xCC); // Skip ROM (Sends command to all sensors, fine if only 1 is connected)
-            DS18B20_WriteByte(0x44); // Convert T command
+            case STATE_INIT_MAC:
+                /* Allow ESP-01S time to boot, then configure */
+                if (current_time - state_timer >= 2000)
+                {
+                    rx_tail = rx_head; // Flush buffer
+                    HAL_UART_Transmit_IT(&huart1, (uint8_t*)"AT+CWMODE=1\r\n", 13);
+                    state_timer = current_time;
+                    current_state = STATE_WAIT_MAC;
+                }
+                break;
+
+            case STATE_WAIT_MAC:
+                if (UART_CheckResponse("\r\nOK\r\n")) {
+                    current_state = STATE_INIT_WIFI;
+                } else if (current_time - state_timer > ESP_TIMEOUT_MS) {
+                    current_state = STATE_ERROR;
+                }
+                break;
+
+            case STATE_INIT_WIFI:
+            {
+                sprintf(tx_buffer, "AT+CWJAP=\"%s\",\"%s\"\r\n", WIFI_SSID, WIFI_PASSWORD);
+                HAL_UART_Transmit_IT(&huart1, (uint8_t*)tx_buffer, strlen(tx_buffer));
+                state_timer = current_time;
+                current_state = STATE_WAIT_WIFI;
+                break;
+            }
+
+            case STATE_WAIT_WIFI:
+                if (UART_CheckResponse("\r\nOK\r\n")) {
+                    state_timer = current_time;
+                    current_state = STATE_IDLE;
+                } else if (current_time - state_timer > 15000) { // WiFi connection can take longer
+                    current_state = STATE_ERROR;
+                }
+                break;
+
+            case STATE_IDLE:
+                /* Non-blocking wait for the next reading interval */
+                if (current_time - state_timer >= TEMP_READ_INTERVAL_MS) {
+                    current_state = STATE_REQUEST_TEMP;
+                }
+                break;
+
+            case STATE_REQUEST_TEMP:
+                if (DS18B20_Start())
+                {
+                    DS18B20_WriteByte(0xCC); // Skip ROM
+                    DS18B20_WriteByte(0x44); // Convert T command
+
+                    state_timer = current_time; // Record conversion start time
+                    current_state = STATE_WAIT_CONVERSION;
+                }
+                else
+                {
+                    current_state = STATE_ERROR;
+                }
+                break;
+
+            case STATE_WAIT_CONVERSION:
+                /* Non-blocking delay: wait for the 12-bit conversion to finish */
+                if (current_time - state_timer >= TEMP_CONV_DELAY_MS)
+                {
+                    current_state = STATE_READ_TEMP;
+                }
+                break;
+
+            case STATE_READ_TEMP:
+            {
+                if (DS18B20_Start())
+                {
+                    DS18B20_WriteByte(0xCC); // Skip ROM
+                    DS18B20_WriteByte(0xBE); // Read Scratchpad
+
+                    uint8_t lsb = DS18B20_ReadByte();
+                    uint8_t msb = DS18B20_ReadByte();
+
+                    uint16_t raw_temp = (msb << 8) | lsb;
+                    current_temperature = (float)raw_temp / 16.0f;
+
+                    current_state = STATE_TCP_CONNECT;
+                }
+                else
+                {
+                    current_state = STATE_ERROR;
+                }
+                break;
+            }
+
+            case STATE_TCP_CONNECT:
+                sprintf(tx_buffer, "AT+CIPSTART=\"TCP\",\"%s\",%d\r\n", SERVER_IP, SERVER_PORT);
+                rx_tail = rx_head; // Flush buffer
+                HAL_UART_Transmit_IT(&huart1, (uint8_t*)tx_buffer, strlen(tx_buffer));
+                state_timer = current_time;
+                current_state = STATE_WAIT_TCP;
+                break;
+
+            case STATE_WAIT_TCP:
+                if (UART_CheckResponse("\r\nOK\r\n") || UART_CheckResponse("ALREADY CONNECTED")) {
+                    current_state = STATE_SEND_LEN;
+                } else if (current_time - state_timer > ESP_TIMEOUT_MS) {
+                    current_state = STATE_ERROR;
+                }
+                break;
+
+            case STATE_SEND_LEN:
+            {
+                /* Format the payload */
+                sprintf(tx_buffer, "Temp: %.2f C\r\n", current_temperature);
+
+                char len_cmd[32];
+                sprintf(len_cmd, "AT+CIPSEND=%d\r\n", (int)strlen(tx_buffer));
+                rx_tail = rx_head;
+                HAL_UART_Transmit_IT(&huart1, (uint8_t*)len_cmd, strlen(len_cmd));
+
+                state_timer = current_time;
+                current_state = STATE_WAIT_PROMPT;
+                break;
+            }
+
+            case STATE_WAIT_PROMPT:
+                if (UART_CheckResponse(">")) {
+                    current_state = STATE_SEND_PAYLOAD;
+                } else if (current_time - state_timer > ESP_TIMEOUT_MS) {
+                    current_state = STATE_ERROR;
+                }
+                break;
+
+            case STATE_SEND_PAYLOAD:
+                rx_tail = rx_head;
+                HAL_UART_Transmit_IT(&huart1, (uint8_t*)tx_buffer, strlen(tx_buffer));
+                state_timer = current_time;
+                current_state = STATE_WAIT_SEND_OK;
+                break;
+
+            case STATE_WAIT_SEND_OK:
+                if (UART_CheckResponse("SEND OK\r\n")) {
+                    HAL_UART_Transmit_IT(&huart1, (uint8_t*)"AT+CIPCLOSE\r\n", 13);
+                    state_timer = current_time;
+                    current_state = STATE_IDLE; // Cycle complete
+                } else if (current_time - state_timer > ESP_TIMEOUT_MS) {
+                    current_state = STATE_ERROR;
+                }
+                break;
+
+            case STATE_ERROR:
+                /* Error recovery: wait, then restart state machine */
+                if (current_time - state_timer >= ESP_TIMEOUT_MS) {
+                    state_timer = current_time;
+                    current_state = STATE_INIT_MAC;
+                }
+                break;
         }
 
-        // Wait for conversion to complete (12-bit resolution requires ~750ms)
-        HAL_Delay(800);
-
-        /* 2. Read Temperature Data */
-        if (DS18B20_Start())
-        {
-            DS18B20_WriteByte(0xCC); // Skip ROM
-            DS18B20_WriteByte(0xBE); // Read Scratchpad
-
-            temp_byte1 = DS18B20_ReadByte(); // LSB
-            temp_byte2 = DS18B20_ReadByte(); // MSB
-
-            // Combine bytes and calculate temperature
-            raw_temp = (temp_byte2 << 8) | temp_byte1;
-            temperature = (float)raw_temp / 16.0;
-
-            /* 3. Send Data via ESP-01S */
-            // Prepare the HTTP GET request or TCP payload string
-            sprintf(uart_buffer, "Temp: %.2f C\r\n", temperature);
-
-            // Example TCP connection to a database server
-            ESP01_SendCommand("AT+CIPSTART=\"TCP\",\"192.168.1.100\",80\r\n");
-            HAL_Delay(1000);
-
-            char send_cmd[30];
-            sprintf(send_cmd, "AT+CIPSEND=%d\r\n", (int)strlen(uart_buffer));
-            ESP01_SendCommand(send_cmd);
-            HAL_Delay(100);
-
-            ESP01_SendCommand(uart_buffer);
-            HAL_Delay(1000);
-
-            ESP01_SendCommand("AT+CIPCLOSE\r\n");
-        }
-        else
-        {
-            // Sensor not detected
-            ESP01_SendCommand("Sensor Error\r\n");
-        }
-
-        /* Read every 10 seconds */
-        HAL_Delay(10000);
+        /* Power Management: Put CPU to sleep until next SysTick or UART interrupt */
+        __WFI();
     }
 }
 
-/* --- ESP-01S Helper Function --- */
-void ESP01_SendCommand(const char *cmd)
+/**
+ * @brief Parses the circular buffer for an expected response.
+ */
+bool UART_CheckResponse(const char *expected)
 {
-    HAL_UART_Transmit(&huart1, (uint8_t*)cmd, strlen(cmd), HAL_MAX_DELAY);
+    if (rx_head == rx_tail) return false;
+
+    /* Build a linear string from the ring buffer for parsing */
+    char temp[RX_BUF_SIZE + 1];
+    uint16_t i = 0;
+    uint16_t curr = rx_tail;
+
+    while (curr != rx_head && i < RX_BUF_SIZE) {
+        temp[i++] = (char)rx_ring_buf[curr];
+        curr = (curr + 1) % RX_BUF_SIZE;
+    }
+    temp[i] = '\0';
+
+    if (strstr(temp, expected) != NULL) {
+        rx_tail = rx_head; // Consume buffer on success
+        return true;
+    }
+
+    if (strstr(temp, "\r\nERROR\r\n") != NULL) {
+        rx_tail = rx_head; // Consume buffer on error to prevent infinite hang
+        return false;
+    }
+
+    return false;
+}
+
+/* --- Interrupt Callbacks --- */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1) {
+        rx_ring_buf[rx_head] = rx_byte;
+        rx_head = (rx_head + 1) % RX_BUF_SIZE;
+        // Re-arm interrupt
+        HAL_UART_Receive_IT(&huart1, (uint8_t*)&rx_byte, 1);
+    }
+}
+
+void USART1_IRQHandler(void)
+{
+    HAL_UART_IRQHandler(&huart1);
+}
+
+void SysTick_Handler(void)
+{
+    HAL_IncTick();
+}
+
+void Error_Handler(void)
+{
+    /* Disable interrupts and spin in an infinite loop */
+    __disable_irq();
+    while (1) { }
 }
 
 /* --- Initialization Functions --- */
@@ -113,7 +336,6 @@ void SystemClock_Config(void)
     RCC_OscInitTypeDef RCC_OscInitStruct = {0};
     RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-    // Configure internal oscillator (HSI) to generate 84MHz
     __HAL_RCC_PWR_CLK_ENABLE();
     __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE2);
 
@@ -126,7 +348,9 @@ void SystemClock_Config(void)
     RCC_OscInitStruct.PLL.PLLN = 336;
     RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
     RCC_OscInitStruct.PLL.PLLQ = 7;
-    HAL_RCC_OscConfig(&RCC_OscInitStruct);
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
+        Error_Handler();
+    }
 
     RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                                 |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
@@ -134,7 +358,9 @@ void SystemClock_Config(void)
     RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
     RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
     RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-    HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2);
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) {
+        Error_Handler();
+    }
 }
 
 static void MX_USART1_UART_Init(void)
@@ -143,7 +369,6 @@ static void MX_USART1_UART_Init(void)
     __HAL_RCC_GPIOA_CLK_ENABLE();
 
     GPIO_InitTypeDef GPIO_InitStruct = {0};
-    // PA9 = TX, PA10 = RX
     GPIO_InitStruct.Pin = GPIO_PIN_9|GPIO_PIN_10;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
@@ -159,21 +384,38 @@ static void MX_USART1_UART_Init(void)
     huart1.Init.Mode = UART_MODE_TX_RX;
     huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
     huart1.Init.OverSampling = UART_OVERSAMPLING_16;
-    HAL_UART_Init(&huart1);
+    if (HAL_UART_Init(&huart1) != HAL_OK) {
+        Error_Handler();
+    }
+
+    /* Enable USART1 Interrupt in NVIC */
+    HAL_NVIC_SetPriority(USART1_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(USART1_IRQn);
 }
 
 static void MX_TIM10_Init(void)
 {
     __HAL_RCC_TIM10_CLK_ENABLE();
 
-    // Timer runs at APB2 clock (84 MHz). Prescaler 84-1 gives 1 MHz (1us tick)
     htim10.Instance = TIM10;
-    htim10.Init.Prescaler = 83;
+
+    /*
+     * ====================================================================
+     * TIMER PRESCALER PROTEUS VS REAL HARDWARE
+     * ====================================================================
+     * IF IN PROTEUS (16MHz): Set Prescaler to 15
+     * IF ON REAL HARDWARE (84MHz): Set Prescaler to 83
+     * ====================================================================
+     */
+    htim10.Init.Prescaler = 15;
+
     htim10.Init.CounterMode = TIM_COUNTERMODE_UP;
     htim10.Init.Period = 0xFFFF;
     htim10.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
     htim10.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-    HAL_TIM_Base_Init(&htim10);
+    if (HAL_TIM_Base_Init(&htim10) != HAL_OK) {
+        Error_Handler();
+    }
 }
 
 static void MX_GPIO_Init(void)
@@ -181,29 +423,38 @@ static void MX_GPIO_Init(void)
     __HAL_RCC_GPIOA_CLK_ENABLE();
 
     GPIO_InitTypeDef GPIO_InitStruct = {0};
-
-    // Configure PA1 for DS18B20 Open-Drain Output
-    GPIO_InitStruct.Pin = DS18B20_PIN;
+    GPIO_InitStruct.Pin = GPIO_PIN_1;
     GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
     GPIO_InitStruct.Pull = GPIO_PULLUP;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-    HAL_GPIO_Init(DS18B20_PORT, &GPIO_InitStruct);
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 }
 
-void SysTick_Handler(void)
+static void MX_IWDG_Init(void)
 {
-    HAL_IncTick();
+    hiwdg.Instance = IWDG;
+    hiwdg.Init.Prescaler = IWDG_PRESCALER_256;
+    hiwdg.Init.Reload = 4095;
+    if (HAL_IWDG_Init(&hiwdg) != HAL_OK) {
+        Error_Handler();
+    }
 }
 
-/* --- _sbrk implementation to satisfy linker --- */
+/* --- _sbrk implementation with Dynamic Stack Collision Protection --- */
 void *_sbrk(int incr) {
     extern char end asm("end");
     static char *heap_ptr = 0;
     char *base;
+    char stack_proxy;
 
     if (heap_ptr == 0) {
         heap_ptr = &end;
     }
+
+    if ((heap_ptr + incr) >= &stack_proxy) {
+        return (void *)-1;
+    }
+
     base = heap_ptr;
     heap_ptr += incr;
     return base;
